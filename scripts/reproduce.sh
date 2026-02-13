@@ -110,7 +110,6 @@ from pyspark.sql.types import StructType, StructField, LongType, StringType
 
 spark = (SparkSession.builder
     .appName("reproduce_step2_hive_write")
-    .master("local[*]")
     .config("spark.sql.catalogImplementation", "in-memory")
     .config("spark.hadoop.mapreduce.output.fs.optimized.committer.enabled", "false")
     .getOrCreate())
@@ -143,7 +142,6 @@ print("=" * 60)
 
 spark2 = (SparkSession.builder
     .appName("reproduce_step3_iceberg")
-    .master("local[*]")
     .config("spark.sql.catalogImplementation", "in-memory")
     .config("spark.sql.catalog.glue_iceberg", "org.apache.iceberg.spark.SparkCatalog")
     .config("spark.sql.catalog.glue_iceberg.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
@@ -207,7 +205,7 @@ scp $SSH_OPTS "$PYSPARK_SCRIPT" "$EMR_USER@$EMR_HOST:/tmp/reproduce.py" 2>/dev/n
 echo "Running on EMR via spark-submit..."
 echo ""
 ssh $SSH_OPTS "$EMR_USER@$EMR_HOST" \
-    'spark-submit --master "local[*]" --conf spark.sql.catalogImplementation=in-memory --conf spark.sql.defaultCatalog=spark_catalog --jars /usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar /tmp/reproduce.py 2>&1 | grep -v "^26/" | grep -v "^SLF4J" | grep -v "^Output:"'
+    'spark-submit --master yarn --deploy-mode client --conf spark.sql.catalogImplementation=in-memory --conf spark.sql.defaultCatalog=spark_catalog --jars /usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar /tmp/reproduce.py 2>&1 | grep -v "^26/" | grep -v "^SLF4J" | grep -v "^Output:"'
 
 rm -f "$PYSPARK_SCRIPT"
 echo ""

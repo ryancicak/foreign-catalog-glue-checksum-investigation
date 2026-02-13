@@ -88,7 +88,7 @@ def run_pyspark_on_emr(script_content, timeout=600):
     os.unlink(local_path)
 
     output = ssh_run(
-        'spark-submit --master "local[*]" '
+        'spark-submit --master yarn --deploy-mode client '
         '--conf spark.sql.catalogImplementation=in-memory '
         '--conf spark.sql.defaultCatalog=spark_catalog '
         '--jars /usr/share/aws/iceberg/lib/iceberg-spark3-runtime.jar '
@@ -152,7 +152,7 @@ def main():
     print("--- Step 1: Current state of table (via EMR) ---")
     show_script = f"""
 from pyspark.sql import SparkSession
-spark = (SparkSession.builder.appName("show_before_fix").master("local[*]")
+spark = (SparkSession.builder.appName("show_before_fix")
 {SPARK_CONFIGS}
     .getOrCreate())
 
@@ -193,7 +193,7 @@ spark.stop()
     print("\n--- Step 2: rewrite_manifests ---")
     rewrite_manifests_script = f"""
 from pyspark.sql import SparkSession
-spark = (SparkSession.builder.appName("rewrite_manifests").master("local[*]")
+spark = (SparkSession.builder.appName("rewrite_manifests")
 {SPARK_CONFIGS}
     .getOrCreate())
 
@@ -216,7 +216,7 @@ spark.stop()
     print("\n--- Step 3: rewrite_data_files ---")
     rewrite_data_script = f"""
 from pyspark.sql import SparkSession
-spark = (SparkSession.builder.appName("rewrite_data_files").master("local[*]")
+spark = (SparkSession.builder.appName("rewrite_data_files")
 {SPARK_CONFIGS}
     .getOrCreate())
 
@@ -246,7 +246,7 @@ spark.stop()
     print("\n--- Step 4: expire_snapshots (retain_last=1) ---")
     expire_script = f"""
 from pyspark.sql import SparkSession
-spark = (SparkSession.builder.appName("expire_snapshots").master("local[*]")
+spark = (SparkSession.builder.appName("expire_snapshots")
 {SPARK_CONFIGS}
     .getOrCreate())
 
@@ -283,7 +283,7 @@ spark.stop()
     print("\n--- Step 5: remove_orphan_files ---")
     orphan_script = f"""
 from pyspark.sql import SparkSession
-spark = (SparkSession.builder.appName("remove_orphan_files").master("local[*]")
+spark = (SparkSession.builder.appName("remove_orphan_files")
 {SPARK_CONFIGS}
     .getOrCreate())
 

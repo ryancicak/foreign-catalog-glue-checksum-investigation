@@ -1,100 +1,54 @@
 # Reproduce: DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED
 
-Reproduces the `DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED` error that occurs when querying a foreign Iceberg table (Glue Catalog) from Databricks. The root cause is inaccurate Iceberg snapshot summary statistics -- the `total-files-size` and/or `total-data-files` values in the snapshot summary don't match what the metadata actually references. Databricks is the only engine that validates these summary stats (during its internal UniForm clone), so the table reads fine from Spark, Trino, etc., but fails from Databricks Foreign Catalog.
-
-This has been confirmed by Databricks engineering: the validation logic is correct. The problem is on the Iceberg metadata side.
-
-See `INVESTIGATION_WRITEUP.md` for the full root cause analysis.
-
-## Prerequisites
-
-You need these before you start:
-
-- **AWS EMR cluster** (EMR 7.x) with Spark and Iceberg installed, SSH access via a PEM key. The EMR instance profile needs S3 and Glue permissions.
-- **Databricks workspace** with Unity Catalog enabled and a service principal with admin or metastore-level privileges.
-- **Python 3.9+** and **pip** on your local machine.
-- **SSH access** from your machine to the EMR master node (security group needs to allow your IP on port 22).
-- **AWS CLI configured** on your local machine (needed only if setting up the foreign catalog from scratch, for Lake Formation permissions).
-
-## Setup
-
-```bash
-# Clone or navigate to this folder
-cd foreign-catalog-glue-checksum-investigation
-
-# Install Python dependencies
-pip install -r requirements.txt
-
-# Copy the example env and fill in your values
-cp .env.example .env
-```
-
-Edit `.env` with your details:
+When you query a foreign Iceberg table from Databricks (via Glue Catalog), you might see this error:
 
 ```
-EMR_HOST=ec2-xx-xx-xx-xx.us-west-2.compute.amazonaws.com
-EMR_PEM_PATH=~/Downloads/your-key.pem
-DATABRICKS_HOST=https://dbc-xxxxx.cloud.databricks.com
-DATABRICKS_CLIENT_ID=your-service-principal-client-id
-DATABRICKS_CLIENT_SECRET=your-service-principal-secret
-S3_BUCKET=your-glue-federation-bucket
-GLUE_DATABASE=your_glue_database
-TABLE_NAME=hive_migrated_to_ice
-FOREIGN_CATALOG=glue_catalog
-AWS_REGION=us-west-2
+[DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED] Clone validation failed - Size and number
+of data files in target table should match with source table.
 ```
 
-If you don't already have a foreign catalog set up, also fill in:
+This repo reproduces the error at 100 million rows, explains why it happens, and shows how to fix it in place.
 
-```
-IAM_ROLE_ARN=arn:aws:iam::123456789012:role/your-cross-account-role
-```
+## Why this happens
 
-This IAM role needs S3 read access on your bucket, Glue read access, and a trust policy allowing the Databricks UC AWS account (`414351767826`) to assume it. The reproduce script will ask if you need the foreign catalog created and handle it for you (storage credential, service credential, external location, Glue connection, federated catalog, and Lake Formation permissions).
+Every Iceberg snapshot has a summary with running totals like total file size and file count. Databricks is the only engine that actually checks whether these totals are correct. If they're wrong, you get this error. Spark, Trino, Presto, and Athena all ignore the summary and read the table fine.
 
-## Step 1: Reproduce the bad table state
+Databricks engineering confirmed their validation is correct. The problem is on the Iceberg side.
 
-The script first asks if you have a foreign catalog already. If not, it sets up the Databricks foreign catalog, Glue connection, and Lake Formation permissions automatically.
+Three things can make the summary wrong:
 
-Then it SSHes into your EMR cluster, writes Hive/Parquet data to S3, creates an Iceberg table at the same location in Glue, and uses `add_files` to adopt the Hive data into the Iceberg metadata. This is exactly how customers end up in this situation.
+**1. `add_files` (Hive-to-Iceberg migration)**
 
-```bash
-bash scripts/reproduce.sh
-```
+When you migrate a Hive table to Iceberg using `add_files`, it records `total-files-size: 0` in the summary even though the files have real sizes. Bug in the procedure.
 
-## Step 2: Trigger the error from Databricks
+> Tested at 100M rows (1.5 GB, 50 files). Fixed in 73 seconds.
 
-Queries the table via the Databricks foreign catalog. You should see:
+**2. Streaming metadata drift**
 
-```
-[DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED] Failed to convert the table version 0
-to the universal format iceberg. Clone validation failed - Size and number of data
-files in target table should match with source table.
-srcTableSize: 0, targetTableSize: 2767 srcTableNumFiles: 2, targetTableNumFiles: 2
-```
+Multiple applications writing to the same table through an HMS-based catalog that can't keep up. The summary falls behind because the metastore handles updates asynchronously. This only happens in production under specific conditions. You can't reproduce it on demand. The native Glue Iceberg catalog handles commits atomically, so it doesn't have this problem.
 
-```bash
-python scripts/query_from_databricks.py
-```
+> Tested at 100M rows (101 rapid commits). Summary stayed accurate. Could not reproduce.
 
-## Step 3: Fix it
+**3. Files in multiple locations + `add_files`**
 
-The error comes from inaccurate Iceberg snapshot summary statistics. The `total-files-size` in the snapshot summary doesn't match the actual sum of file sizes referenced by the metadata. Databricks reads the summary stats during its internal clone validation and fails when they don't line up.
+Data files spread across different subdirectories get adopted via `add_files`. The summary only counts the original native writes. Adopted file sizes never get added to `total-files-size`. The gap grows with every adoption.
 
-The fix is Iceberg table maintenance run from Spark (on EMR, Glue jobs, or wherever the customer manages their Iceberg tables):
+> Tested at 100M rows (883 MB actual, summary said 136 MB). Fixed in 100 seconds.
 
-### Tier 1: Try `rewrite_manifests` first (cheapest)
+Full details and test results in `INVESTIGATION_WRITEUP.md`.
 
-This rewrites the manifest files and creates a new snapshot. If the problem is that the snapshot summary aggregates drifted from what the manifests describe, this may recompute the stats correctly without touching any data files.
+## How to fix it
+
+Run Iceberg maintenance from Spark. Two options:
+
+**Option A (lightweight, try first):**
 
 ```sql
 CALL catalog.system.rewrite_manifests('db.table');
 CALL catalog.system.expire_snapshots(table => 'db.table', retain_last => 1);
 ```
 
-### Tier 2: `rewrite_data_files` (guaranteed fix)
-
-If `rewrite_manifests` alone doesn't resolve it, rewrite the actual data files. This reads every file, writes new ones, and creates a new snapshot with correct statistics computed from scratch.
+**Option B (guaranteed fix, if A doesn't work):**
 
 ```sql
 CALL catalog.system.rewrite_data_files(
@@ -106,41 +60,25 @@ CALL catalog.system.rewrite_data_files(
 CALL catalog.system.expire_snapshots(table => 'db.table', retain_last => 1);
 ```
 
-### Then clean up orphans
+`expire_snapshots` is required. Without it, the old broken snapshot sticks around and Databricks will still fail.
 
-After either tier, optionally remove any leftover files that are no longer referenced:
-
-```sql
-CALL catalog.system.remove_orphan_files(table => 'db.table');
-```
-
-The cleanup script runs the full sequence (rewrite manifests, rewrite data files, expire snapshots), then queries from Databricks to confirm:
+## Quick start
 
 ```bash
-python scripts/cleanup.py
+pip install -r requirements.txt
+cp .env.example .env        # fill in your EMR and Databricks details
+bash scripts/reproduce.sh    # create the broken table on EMR
+python scripts/query_from_databricks.py   # trigger the error
+python scripts/cleanup.py    # fix it and verify
 ```
 
-For large tables (hundreds of GBs or more), run on a properly sized cluster using `--master yarn` instead of `local[*]`.
-
-## What's going on
-
-When Databricks reads a foreign Iceberg table via the Glue catalog, it clones the table internally into a Delta table with UniForm (Iceberg compatibility). During the clone, it validates that the snapshot summary statistics (file count, total data size) match what it computes by following the metadata's file references. If they don't match, you get `DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED`.
-
-The snapshot summary can become inaccurate through several paths:
-
-- **Hive-to-Iceberg migration via `add_files`**: The `add_files` procedure records `total-files-size: 0` in the snapshot summary, even though the adopted files have real sizes. This is a bug in the procedure.
-- **Streaming writes with metadata drift**: High-frequency streaming writes can cause the catalog's summary aggregation to fall behind or lose track, especially with HMS-based catalogs like Glue.
-- **File location configuration changes**: Changing where new data files land (e.g., switching from root-level writes to a `/data/` subdirectory) can cause the summary to undercount files and sizes from the old location.
-
-In all cases, the actual Iceberg table works fine. The manifests and file entries are correct. It's only the summary-level aggregate stats that are wrong. Databricks is the only engine strict enough to validate them.
-
-This is not a Databricks bug. Databricks engineering has confirmed the validation logic is correct -- it follows the Iceberg metadata's file references and correctly computes totals. The problem is that the Iceberg snapshot summary statistics don't accurately reflect what the metadata references.
+You need an EMR cluster with Spark/Iceberg and a Databricks workspace with a foreign catalog pointing at Glue. See `.env.example` for all the config fields.
 
 ## Files
 
 | File | What it does |
 |------|-------------|
-| `scripts/reproduce.sh` | Sets up the broken table on EMR (Hive write + Iceberg create + add_files). Optionally sets up the foreign catalog first. |
-| `scripts/setup_foreign_catalog.py` | Creates Databricks storage/service credentials, external location, Glue connection, federated catalog, and Lake Formation permissions |
-| `scripts/query_from_databricks.py` | Queries the foreign catalog table from Databricks, shows the error |
-| `scripts/cleanup.py` | Fixes the table via `rewrite_manifests` + `rewrite_data_files` + `expire_snapshots` on EMR, re-queries from Databricks to confirm |
+| `scripts/reproduce.sh` | Creates the broken table on EMR |
+| `scripts/setup_foreign_catalog.py` | Sets up the Databricks foreign catalog and Lake Formation permissions |
+| `scripts/query_from_databricks.py` | Queries from Databricks to trigger the error |
+| `scripts/cleanup.py` | Runs the full fix and verifies from Databricks |
