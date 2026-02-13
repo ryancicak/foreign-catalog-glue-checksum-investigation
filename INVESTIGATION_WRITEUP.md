@@ -9,7 +9,7 @@ files in target table should match with source table.
 srcTableSize: 0, targetTableSize: 2767 srcTableNumFiles: 2, targetTableNumFiles: 2
 ```
 
-## Environment
+## Environment (reproduction)
 
 - Databricks Workspace: `dbc-0b9b3487-05d4.cloud.databricks.com`
 - Foreign Catalog: `glue_catalog` (AWS Glue, `us-west-2`)
@@ -21,7 +21,13 @@ srcTableSize: 0, targetTableSize: 2767 srcTableNumFiles: 2, targetTableNumFiles:
 
 ## Quick Summary
 
-Reproduced and confirmed. The customer had a Hive/Parquet table, migrated it to Iceberg, and the old data files at the root of the S3 path cause a size mismatch during Databricks' internal clone validation. It's not corrupted data, it's just leftover junk from the old table format. Clean it up and the error goes away.
+The error fires when Databricks' internal clone validation finds that the Iceberg snapshot summary statistics (file count, total data size) don't match what it computes by actually following the metadata's file references.
+
+The `src` side of the error comes from the Iceberg snapshot summary (`total-files-size`, `total-data-files`). The `target` side is what Databricks computes by reading the manifests and summing up the actual file sizes. Databricks' numbers are correct. The Iceberg snapshot summary is what's wrong.
+
+This has been confirmed by Databricks engineering: the validation logic accurately follows file references in the metadata. The mismatch is caused by inaccurate snapshot summary statistics on the Iceberg side.
+
+The fix: Iceberg table maintenance (`rewrite_manifests` and/or `rewrite_data_files`, followed by `expire_snapshots`) to create a new snapshot with correct summary stats and remove the old broken ones.
 
 ---
 
@@ -31,9 +37,9 @@ When you query `SELECT * FROM glue_catalog.schema.table`, Databricks doesn't jus
 
 1. It clones the foreign Iceberg table into an internal Delta table (stored under `__unitystorage/catalogs/.../uniform`)
 2. That Delta table gets UniForm properties so it maintains both Delta and Iceberg metadata
-3. Before serving results, it validates the clone. The Delta side and the Iceberg side need to agree on file counts and total data size
+3. Before serving results, it validates the clone: the snapshot summary statistics need to match what it computes by following the metadata file references
 
-If they don't agree, you get `DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED`.
+If they don't match, you get `DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED`.
 
 After a successful clone, the internal Delta table has properties like:
 - `lastConvertedMetadataLocation` pointing back to the Glue Iceberg metadata JSON
@@ -44,51 +50,38 @@ After a successful clone, the internal Delta table has properties like:
 
 ## What actually causes the error
 
-Reproduced this exactly. Here's the sequence:
+The Iceberg snapshot summary includes aggregate statistics like `total-files-size` and `total-data-files`. These are supposed to be running totals maintained as commits happen. Databricks reads these summaries and cross-checks them against what it computes by walking the actual manifest entries.
 
-### 1. Customer writes data with Hive/Parquet
+When the summary stats are wrong, the validation fails. There are multiple ways the summary can become inaccurate:
 
-Standard Hive writes to S3. Files land at the root of the table path:
+### Cause 1: `add_files` procedure (what we reproduced)
 
-```
-s3://bucket/db/table/
-  _SUCCESS
-  part-00000-436014f8-*.snappy.parquet   (1,377 bytes, 5 rows)
-  part-00001-436014f8-*.snappy.parquet   (1,390 bytes, 5 rows)
-```
+When a customer migrates from Hive to Iceberg using `add_files` (or `migrate`), the procedure creates a snapshot that adopts the existing Hive parquet files. But it records `total-files-size: 0` in the snapshot summary, even though the adopted files have real sizes. This is a bug in the `add_files` procedure.
 
-### 2. Customer migrates to Iceberg
-
-They create an Iceberg table at the same S3 location and use `add_files` (or `migrate`) to adopt the existing Hive parquet files into Iceberg metadata. Now Iceberg knows about those two `part-*` files.
-
-S3 location now looks like:
+In our reproduction:
 
 ```
-s3://bucket/db/table/
-  _SUCCESS                                       <-- leftover Hive artifact
-  part-00000-436014f8-*.snappy.parquet           <-- adopted by Iceberg
-  part-00001-436014f8-*.snappy.parquet           <-- adopted by Iceberg
-  metadata/00000-*.metadata.json                 <-- Iceberg: empty table creation
-  metadata/00001-*.metadata.json                 <-- Iceberg: schema setup
-  metadata/00002-*.metadata.json                 <-- Iceberg: after add_files
-  metadata/snap-*.avro                           <-- Iceberg snapshot
-  metadata/stage-*-manifest-*.avro               <-- Iceberg manifest
-```
-
-### 3. Databricks tries to read it via foreign catalog
-
-Databricks clones the table. Here's the problem: the Delta clone starts at version 0 (empty table creation), which has `srcTableSize: 0`. But the Iceberg UniForm side already has a snapshot with 2 data files totaling 2,767 bytes (`targetTableSize: 2767`).
-
-The validation catches this:
-
-```
-srcTableSize: 0       <-- Delta version 0 (empty)
-targetTableSize: 2767 <-- Iceberg snapshot (has the adopted Hive files)
+srcTableSize: 0       <-- from snapshot summary (total-files-size: 0, the bug)
+targetTableSize: 2767 <-- actual sum of file sizes (Databricks computed correctly)
 srcTableNumFiles: 2
 targetTableNumFiles: 2
 ```
 
-File count matches (2 = 2), but size doesn't (0 != 2767). Clone validation fails.
+File count matches (2 = 2), but size doesn't (0 != 2767).
+
+### Cause 2: Streaming metadata drift
+
+High-frequency streaming writes can cause the snapshot summary aggregates to drift from reality. The catalog may not keep up with the rate of changes, or the thread responsible for updating summary stats may hang. This is more common with HMS-based catalogs like Glue. The Iceberg community moved away from HMS-based catalogs early on partly for this reason.
+
+### Cause 3: File location configuration changes
+
+If the customer changes where new data files land (e.g., from writing at the table root to a `/data/` subdirectory, or changing to date-stamped directories), the summary aggregation can lose track of files from the old location. The manifests correctly reference all the files regardless of where they live, but the summary totals only account for a subset.
+
+In production, this can result in massive discrepancies where the snapshot summary reports a fraction of the actual file count and total size. The manifests correctly reference files across all subdirectories, but the summary totals lag behind or only account for files written under a specific path prefix.
+
+### In all cases
+
+The actual Iceberg table works fine from Spark, Trino, Presto, etc. The manifests and file entries are correct. Queries return the right data. It's only the snapshot-level summary stats that are wrong. Databricks is the only engine that validates these summary stats because of its internal UniForm clone process.
 
 ---
 
@@ -123,7 +116,7 @@ Took me a few attempts to actually reproduce this. These approaches did not work
 - `iceberg_size_mismatch_test`: Modified the actual parquet data file on S3 to be a different size than what Iceberg metadata records. Also read fine because parquet readers just ignore trailing garbage.
 - `migrated_hive_to_iceberg`: Clean Iceberg table at same path as old Hive files. Read fine.
 
-The thing that actually matters is the Delta-to-Iceberg version mismatch during the internal clone. Specifically when the Iceberg snapshot has files that weren't part of the Delta table version being converted. Just having extra junk files sitting in the directory isn't enough.
+The thing that actually matters is the snapshot summary stats being inaccurate. Just having extra junk files sitting in the directory isn't enough. Databricks follows the metadata file references, not directory listings.
 
 The EMR catalog configuration was also annoying to deal with. The cluster was set up with the UC REST catalog as the default Spark catalog (`cicaktest_catalog`), and the SparkSessionCatalog + Glue metastore factory had classloader issues with the Iceberg Hive client. Ended up using the Glue Iceberg catalog directly with `add_files` to get the migration path working.
 
@@ -131,58 +124,94 @@ The EMR catalog configuration was also annoying to deal with. The cluster was se
 
 ## How to fix it
 
-### For tables migrated from Hive/Parquet
+The goal is to create a new snapshot with correct summary statistics, then remove the old snapshots that had incorrect stats.
 
-The data files adopted via `add_files` or `migrate` create this version history inconsistency. Cleanest fix is to just re-create the table:
+### Tier 1: `rewrite_manifests` + `expire_snapshots` (try this first)
 
-1. CTAS into a new Iceberg table at a fresh S3 location:
-
-```sql
-CREATE TABLE glue_iceberg.db.table_clean
-USING iceberg
-LOCATION 's3://bucket/db/table_clean/'
-AS SELECT * FROM glue_iceberg.db.table_broken;
-```
-
-2. Drop the old table and rename the new one.
-
-### Important: deleting orphan files alone does NOT fix this
-
-During the investigation I initially assumed that removing stale Hive files from S3 would fix the error. It doesn't. The adopted `part-*` files are tracked by Iceberg (they were imported via `add_files`), so they're not orphans. The `_SUCCESS` marker is the only actual orphan, and removing it changes nothing.
-
-The root cause is in the metadata version history, not in what's on disk. The Iceberg table's version 0 is an empty table creation, but the snapshot already references files. That inconsistency is what Databricks catches. The only fix is CTAS.
-
-### For tables with orphaned files from compaction (different problem)
-
-If you're seeing this error for a different reason (compaction orphans rather than a Hive migration), Iceberg maintenance might help:
+This is the cheapest option. It rewrites the manifest files and creates a new snapshot without touching the actual data files. If the summary stats get recomputed correctly from the manifest rewrite, this is all you need.
 
 ```sql
-CALL glue_iceberg.system.expire_snapshots(
+CALL catalog.system.rewrite_manifests('db.table');
+
+CALL catalog.system.expire_snapshots(
     table => 'db.table',
-    older_than => TIMESTAMP '2026-02-01 00:00:00',
     retain_last => 1
 );
+```
 
-CALL glue_iceberg.system.remove_orphan_files(
-    table => 'db.table'
+After running both, query the table from Databricks. If the error is gone, you're done.
+
+### Tier 2: `rewrite_data_files` + `expire_snapshots` (guaranteed fix)
+
+If `rewrite_manifests` didn't fix it, rewrite the actual data files. This is heavier (reads and rewrites every data file) but guaranteed to produce a new snapshot with correct statistics, because the stats are computed from the freshly written files.
+
+```sql
+CALL catalog.system.rewrite_data_files(
+    table => 'db.table',
+    strategy => 'sort',
+    sort_order => 'id ASC NULLS LAST',
+    options => map('min-input-files', '1')
+);
+
+CALL catalog.system.expire_snapshots(
+    table => 'db.table',
+    retain_last => 1
 );
 ```
 
-But if the table was migrated from Hive, CTAS is the answer.
+The `min-input-files: 1` forces Iceberg to rewrite even if it thinks the files are already well-organized. The sort strategy ensures the rewrite actually happens (bin-packing may skip small files that already meet the target size).
+
+For large tables, run this on a properly sized cluster using `--master yarn` to distribute the work across the cluster.
+
+### Optional: `remove_orphan_files`
+
+After either tier, optionally clean up orphaned files (files on disk that aren't referenced by any snapshot):
+
+```sql
+CALL catalog.system.remove_orphan_files(table => 'db.table');
+```
+
+This won't fix the error on its own (the error is about summary stats, not orphan files), but it's good hygiene.
+
+### Important: `expire_snapshots` is required
+
+Running `rewrite_manifests` or `rewrite_data_files` alone isn't enough. These commands create new snapshots, but the old snapshots with bad summary stats still exist. `expire_snapshots` with `retain_last => 1` removes them so Databricks won't try to validate against the broken ones.
+
+### Why not CTAS?
+
+CTAS (Create Table As Select) into a new table at a fresh S3 path also works, but it's heavier than it needs to be:
+
+- Requires a new table name and a new S3 location
+- Requires dropping the old table and renaming the new one (or updating all downstream references)
+- Doubles your storage temporarily while both tables exist
+- For large tables, that's a lot of unnecessary data copying
+
+Iceberg maintenance procedures fix the table in-place. Same name, same location, no downstream changes.
+
+### Important: if the root cause is ongoing, it will happen again
+
+If the inaccurate summary stats are caused by something ongoing (e.g., a streaming write pipeline, a misconfigured catalog, or a write pattern that doesn't update summaries correctly), the error will come back after the next batch of writes. The customer needs to identify and fix whatever is causing the summary drift, not just run maintenance as a one-time fix.
 
 ---
 
 ## What to tell the customer
 
-Don't worry about this. The error means:
+This error means the Iceberg table's snapshot summary statistics are inaccurate. The summary reports different file counts or total sizes than what the metadata actually references. Databricks validates these stats during its internal Foreign Catalog clone process and catches the mismatch.
 
-1. The table was originally Hive/Parquet and got migrated to Iceberg
-2. The migration left inconsistencies in how the data files relate to the Iceberg version history
-3. Databricks Foreign Catalog's internal clone validation catches that mismatch
+This is not data corruption. No data loss. The Iceberg table itself works fine from Spark, Trino, or any other engine that doesn't validate snapshot summaries. This is specific to how Databricks clones foreign Iceberg tables into its internal Delta + UniForm format.
 
-No data corruption. No data loss. The Iceberg table itself works fine from Spark, Trino, whatever. This is specific to how Databricks clones foreign Iceberg tables into its internal Delta + UniForm format.
+Common causes:
+1. Hive-to-Iceberg migration via `add_files` or `migrate` (records `total-files-size: 0`)
+2. High-frequency streaming writes causing summary metadata drift
+3. File location configuration changes causing the summary to undercount
 
-Fix: re-create the table cleanly (CTAS to a new S3 location). The new table has a consistent version history from the start. Foreign Catalog will clone it without complaints after that.
+Fix: run Iceberg table maintenance from Spark (or wherever they manage their Iceberg tables):
+
+1. Try `rewrite_manifests` + `expire_snapshots` first (lightweight, no data rewrite)
+2. If that doesn't resolve it, run `rewrite_data_files` + `expire_snapshots` (heavier, but guaranteed)
+3. Optionally `remove_orphan_files` for cleanup
+
+If the problem recurs after writes resume, the underlying write pipeline or catalog configuration needs attention.
 
 ---
 
@@ -193,4 +222,4 @@ Fix: re-create the table cleanly (CTAS to a new S3 location). The new table has 
 | `scripts/reproduce.sh` | Sets up the broken table on EMR (Hive write + Iceberg create + add_files). Optionally sets up the foreign catalog first. |
 | `scripts/setup_foreign_catalog.py` | Creates Databricks storage/service credentials, external location, Glue connection, federated catalog, and Lake Formation permissions |
 | `scripts/query_from_databricks.py` | Queries the foreign catalog table from Databricks, shows the error |
-| `scripts/cleanup.py` | Fixes the table via CTAS on EMR, re-queries both broken and fixed tables from Databricks |
+| `scripts/cleanup.py` | Fixes the table via `rewrite_manifests` + `rewrite_data_files` + `expire_snapshots` on EMR, re-queries from Databricks to confirm |
