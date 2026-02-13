@@ -11,7 +11,7 @@ This repo reproduces the error at 100 million rows, explains why it happens, and
 
 ## Why this happens
 
-Every Iceberg snapshot has a summary with running totals like total file size and file count. Databricks is the only engine that actually checks whether these totals are correct. If they're wrong, you get this error. Spark, Trino, Presto, and Athena all ignore the summary and read the table fine.
+Every Iceberg snapshot has a summary with running totals like total file size and file count. These fields are optional in the Iceberg spec, and nothing enforces that writers keep them accurate. Databricks is the only engine that checks whether these totals are correct. If they're wrong, you get this error. Spark, Trino, Presto, and Athena all skip the summary and go straight to the manifests, which is why the table reads fine everywhere else.
 
 Databricks engineering confirmed their validation is correct. The problem is on the Iceberg side.
 
@@ -23,34 +23,34 @@ When you migrate a Hive table to Iceberg using `add_files`, it records `total-fi
 
 > Tested at 100M rows (1.5 GB, 50 files). Fixed in 73 seconds.
 
-**2. Streaming metadata drift**
-
-Multiple applications writing to the same table through an HMS-based catalog that can't keep up. The summary falls behind because the metastore handles updates asynchronously. This only happens in production under specific conditions. You can't reproduce it on demand. The native Glue Iceberg catalog handles commits atomically, so it doesn't have this problem.
-
-> Tested at 100M rows (101 rapid commits). Summary stayed accurate. Could not reproduce.
-
-**3. Files in multiple locations + `add_files`**
+**2. Files in multiple locations + `add_files`**
 
 Data files spread across different subdirectories get adopted via `add_files`. The summary only counts the original native writes. Adopted file sizes never get added to `total-files-size`. The gap grows with every adoption.
 
 > Tested at 100M rows (883 MB actual, summary said 136 MB). Fixed in 100 seconds.
 
+**3. Non-atomic writes to Iceberg**
+
+When metadata is written separately from the data (common with streaming tables from engines like Snowflake), the summary fields can end up inaccurate. If the optional summary fields are populated but wrong, Databricks catches the mismatch. The native Glue Iceberg catalog handles commits atomically, so it doesn't have this problem on its own.
+
+> Could not reproduce organically (Glue Iceberg catalog commits atomically). Simulated at 100M rows by corrupting the metadata JSON to mimic a non-atomic writer. Error triggered. Fixed by correcting the summary directly from manifest data. Note: `rewrite_data_files` does NOT fix this case because Iceberg computes summaries incrementally, so wrong values carry forward.
+
 Full details and test results in `INVESTIGATION_WRITEUP.md`.
 
 ## How to fix it
 
-Run Iceberg maintenance from Spark. Two options:
+Run Iceberg maintenance from Spark. The right fix depends on the cause.
 
-**Option A (lightweight, try first):**
+**For Causes 1 and 2 (`add_files` related). Try Option A first:**
 
 ```sql
+-- Option A: lightweight, rewrites manifests only
 CALL catalog.system.rewrite_manifests('db.table');
 CALL catalog.system.expire_snapshots(table => 'db.table', retain_last => 1);
 ```
 
-**Option B (guaranteed fix, if A doesn't work):**
-
 ```sql
+-- Option B: if A doesn't work, rewrite the actual data files
 CALL catalog.system.rewrite_data_files(
     table => 'db.table',
     strategy => 'sort',
@@ -61,6 +61,17 @@ CALL catalog.system.expire_snapshots(table => 'db.table', retain_last => 1);
 ```
 
 `expire_snapshots` is required. Without it, the old broken snapshot sticks around and Databricks will still fail.
+
+**For Cause 3 (non-atomic writers with fundamentally wrong summary):**
+
+`rewrite_data_files` does not fix this. Iceberg computes summaries incrementally, so wrong values carry forward into the new snapshot. The fix is to correct the summary directly:
+
+1. Read actual file count and total size from the manifests (via Spark)
+2. Update the snapshot summary in the metadata JSON with correct values
+3. Write the corrected metadata file to S3
+4. Update the catalog pointer to the new metadata file
+
+See `INVESTIGATION_WRITEUP.md` for a full walkthrough with before/after results.
 
 ## Quick start
 
